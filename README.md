@@ -8,6 +8,14 @@ Trevor Chow
 # Goal
 Building balancing robot with 2-wheels 
 
+# Parts 
+- ESP32
+- motor
+- motor drivers
+- voltage regulator/booster
+- distance sensor 
+
+
 # Timeline
 Proposal - Thu 10/23/25
 Project Progress Report + Demo Video - Wed 11/26
