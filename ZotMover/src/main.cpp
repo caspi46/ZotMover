@@ -92,6 +92,19 @@ void setup()
 
   // Set initial speed
   motor.setSpeed(0); // Set initial speed to 0
+
+  Wire.begin();
+  delay(10);
+  if (myIMU.begin())
+    Serial.println("Ready.");
+  else
+  {
+    Serial.println("Could not connect to IMU.");
+    Serial.println("Freezing");
+  }
+
+  if (myIMU.initialize(BASIC_SETTINGS))
+    Serial.println("Loaded Settings.");
 }
 
 void loop()
@@ -104,3 +117,10 @@ void loop()
   // accelerometer: (x, y, z)
   // cloud data
 }
+
+// TODO:
+// #1 Set up: cloud (in-review), motor driver (in-review), gyroscope (in-review)
+// #2 Test individually (just connection)=> review cloud, motor driver, and gyroscope from examples or previous assignments
+// #3 discuss the communication protocol between motor driver and gyropscope
+// #4 send data to cloud
+// #5 visualize tilt and speed over time
