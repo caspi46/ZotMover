@@ -5,17 +5,24 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include "Wire.h"
 #include <ArduinoJson.h>
+
+// pin declarations
+#define BAT_ADC 34
+#define ENAPin 27
+#define motorAPin1 26
+#define motorAPin2 25
+#define ENBPin 15
+#define motorBPin3 12
+#define motorBPin4 13
 
 // Wi-Fi credentials
 #define WIFI_SSID "TC"           // NOTE: Please delete this value before submitting assignment
 #define WIFI_PASSWORD "12341234" // NOTE: Please delete this value before submitting assignment
 // Azure IoT Hub configuration
-#define SAS_TOKEN "SharedAccessSignature sr=cs147hub39.azure-devices.net%2Fdevices%2F147esp32&sig=YvsUAQIDHyB2BVio%2FewGasVdA7Q5Ivw6pPYZdGPh%2BBM%3D&se=1763775054"
+#define SAS_TOKEN ""
 // Root CA certificate for Azure IoT Hub
-// const char* root_ca = "Get from Azure IoT Hub";
-const char *root_ca =
+const char* root_ca =
     "-----BEGIN CERTIFICATE-----\n"
     "MIIEtjCCA56gAwIBAgIQCv1eRG9c89YADp5Gwibf9jANBgkqhkiG9w0BAQsFADBh\n"
     "MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\n"
@@ -45,35 +52,34 @@ const char *root_ca =
     "q/xKzj3O9hFh/g==\n"
     "-----END CERTIFICATE-----\n";
 
-#define BAT_ADC 34
-#define motorAPin1 26
-#define motorAPin2 25
-#define ENAPin 38
-#define motorBPin3 33
-#define motorBPin4 32
-#define ENBPin 37
+// Telemetry interval
+#define TELEMETRY_INTERVAL 3000 // Send data every 3 seconds
+
 
 LSM6DSO myIMU;
-L298NX2 motor(motorAPin1, motorAPin2, ENAPin, motorBPin3, motorBPin4, ENBPin);
+L298NX2 motors(ENAPin, motorAPin1, motorAPin2, ENBPin, motorBPin3, motorBPin4);
 
-String iothubName = "cs147hub39"; // Your hub name (replace if needed)
+String iothubName = "ZotMoverHub"; // Your hub name (replace if needed)
 String deviceName = "147esp32";   // Your device name (replace if needed)
 String url = "https://" + iothubName + ".azure-devices.net/devices/" +
              deviceName + "/messages/events?api-version=2021-04-12";
 
+float x, y, z;
+uint32_t lastTelemetryTime = 0;
+
 void setup()
 {
+  Serial.begin(115200);
   Wire.begin();
 
+  // wifi/cloud setup
   WiFi.mode(WIFI_STA);
   delay(1000);
-  Serial.println();
+
   Serial.println();
   Serial.print("Connecting to ");
   Serial.println(WIFI_SSID);
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
@@ -87,12 +93,12 @@ void setup()
   Serial.println(WiFi.localIP());
   Serial.println("MAC address: ");
   Serial.println(WiFi.macAddress());
-  Serial.begin(9600);
   pinMode(BAT_ADC, INPUT);
 
-  // Set initial speed
-  motor.setSpeed(0); // Set initial speed to 0
+  // motor setup
+  motors.setSpeed(0); // Set initial speed to 0
 
+  // IMU setup
   Wire.begin();
   delay(10);
   if (myIMU.begin())
@@ -109,18 +115,51 @@ void setup()
 
 void loop()
 {
-
-  delay(1000); // Delay for readability
-
   // motor driver
+  motors.setSpeed(0);
+  motors.forward();
+  Serial.println("Moving forward");
+
   // gyroscope: (x, y, z)
   // accelerometer: (x, y, z)
+
   // cloud data
+  // if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL) { // uncomment to enable telemetry
+  if (false) {
+    float acceleration = myIMU.readFloatAccelX(); // TODO: revise data to send after robot mechanics done
+    float tilt = myIMU.readFloatGyroX();
+
+    ArduinoJson::JsonDocument doc;
+    doc["acceleration"] = acceleration;
+    doc["tilt"] = tilt;
+    char buffer[256];
+    serializeJson(doc, buffer, sizeof(buffer));
+
+    // Send telemetry via HTTPS
+    WiFiClientSecure client;
+    client.setCACert(root_ca); // Set root CA certificate
+    HTTPClient http;
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", SAS_TOKEN);
+    int httpCode = http.POST(buffer);
+
+    if (httpCode == 204) { // IoT Hub returns 204 No Content for successful telemetry
+    Serial.println("Telemetry sent: " + String(buffer));
+    } else {
+    Serial.println("Failed to send telemetry. HTTP code: " + String(httpCode));
+    }
+    http.end();
+
+    lastTelemetryTime = millis();
+  }
+
+  delay(1000);
 }
 
 // TODO:
-// #1 Set up: cloud (in-review), motor driver (in-review), gyroscope (in-review)
-// #2 Test individually (just connection)=> review cloud, motor driver, and gyroscope from examples or previous assignments
+// #1 Set up: cloud (done), motor driver (done), gyroscope (done)
+// #2 Test individually (just connection)=> review cloud (done), motor driver (not enough torque), and gyroscope (done) from examples or previous assignments
 // #3 discuss the communication protocol between motor driver and gyropscope
 // #4 send data to cloud
 // #5 visualize tilt and speed over time
