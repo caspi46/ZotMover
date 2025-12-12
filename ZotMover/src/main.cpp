@@ -8,21 +8,27 @@
 #include <ArduinoJson.h>
 #include "math.h"
 
-// pin declarations
-#define BAT_ADC 34
+// motor driver pin declarations a=left b=right
 #define ENAPin 27
 #define motorAPin1 26
 #define motorAPin2 25
 #define ENBPin 15
 #define motorBPin3 12
 #define motorBPin4 13
+// motor encoder pins
+#define motorAEncA 32 
+#define motorAEncB 33 
+#define motorBEncA 37
+#define motorBEncB 38
 
-
-#define Kp  40
+// tuning parameters
+#define Kp  -60
 #define Kd  0.05
-#define Ki  40
+#define Ki  0
+#define Kp_speed 0
+#define Ki_speed 0
 #define sampleTime  0.005
-#define targetAngle -2.5
+#define targetAngle 19.8
 
 // Wi-Fi credentials
 #define WIFI_SSID "TC"           // NOTE: Please delete this value before submitting assignment
@@ -61,15 +67,12 @@ const char* root_ca =
     "-----END CERTIFICATE-----\n";
 
 // Telemetry interval
-#define TELEMETRY_INTERVAL 3000 // Send data every 3 seconds
-
+#define TELEMETRY_INTERVAL 250 // Send data every __ ms
 
 // IMU object
 LSM6DSO myIMU;
 // Motor driver object
 L298NX2 motors(ENAPin, motorAPin1, motorAPin2, ENBPin, motorBPin3, motorBPin4);
-// motor direction bool 
-bool motorDirection = true; // true: forward, false: backward 
 
 // Cloud variables 
 String iothubName = "ZotMoverHub"; // Your hub name (replace if needed)
@@ -79,18 +82,82 @@ String url = "https://" + iothubName + ".azure-devices.net/devices/" +
 
 
 // Gyroscope / Accelerometer variables 
-int16_t accX, accY, accZ; // accelerometer values
-int16_t gyroX, gyroY, gyroZ; // gyroscope values
-
+float accX, accY, accZ; // accelerometer values
+float gyroX, gyroY, gyroZ; // gyroscope values
 float accAngle, gyroAngle; 
+float motorPower, currentAngle, prevAngle = 0, error, prevError=0, errorSum = 0;
 
-volatile float motorPower, gyroRate, currentAngle, prevAngle = 0, error, prevError=0, errorSum = 0;
+// Encoder variables
+volatile long leftEncoderCount = 0;
+volatile long rightEncoderCount = 0;
+long prevLeftCount = 0;
+long prevRightCount = 0;
+
+// Speed control variables
+float currentSpeed = 0;
+float speedIntegral = 0;
+float activeTargetAngle = targetAngle;
 
 int speed;
+void setMotors(int leftMotorSpeed, int rightMotorSpeed);
 
-
+// Telemetry variables
 long lastTime = 0;
 uint32_t lastTelemetryTime = 0;
+volatile float sharedAccel = 0;
+volatile float sharedTilt = 0;
+TaskHandle_t Task1;
+
+// --- INTERRUPT SERVICE ROUTINES (ISRs) ---
+void IRAM_ATTR readLeftEncoder() {
+  // check phase B for direction
+  if (digitalRead(motorAEncB) == HIGH) {
+    leftEncoderCount++;
+  } else {
+    leftEncoderCount--;
+  }
+}
+void IRAM_ATTR readRightEncoder() {
+  if (digitalRead(motorBEncB) == HIGH) {
+    rightEncoderCount++;
+  } else {
+    rightEncoderCount--;
+  }
+}
+
+void telemetryLoop(void * parameter) {
+  while(true) {
+    // cloud data
+    if (WiFi.status() == WL_CONNECTED) {
+      // send angles of acceleration and gyroscope calculated
+      float sendAccel = sharedAccel;
+      float sendTilt = sharedTilt;
+      ArduinoJson::JsonDocument doc;
+      doc["acceleration"] = accAngle;
+      doc["tilt"] = gyroAngle;
+      char buffer[256];
+      serializeJson(doc, buffer, sizeof(buffer));
+
+      // Send telemetry via HTTPS
+      WiFiClientSecure client;
+      client.setCACert(root_ca); // Set root CA certificate
+      HTTPClient http;
+      http.begin(client, url);
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("Authorization", SAS_TOKEN);
+      int httpCode = http.POST(buffer);
+
+      // commented out serial prints for performance
+      // if (httpCode == 204) { // IoT Hub returns 204 No Content for successful telemetry
+      // Serial.println("Sent");
+      // } else {
+      // Serial.println("Fail");
+      // }
+      http.end();
+    }
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+}
 
 void setup()
 {
@@ -118,91 +185,80 @@ void setup()
   Serial.println(WiFi.localIP());
   Serial.println("MAC address: ");
   Serial.println(WiFi.macAddress());
-  pinMode(BAT_ADC, INPUT);
 
   // motor setup
   motors.setSpeed(0); // Set initial speed to 0
+  // encoder Setup
+  pinMode(motorAEncA, INPUT);
+  pinMode(motorAEncB, INPUT);
+  pinMode(motorBEncA, INPUT);
+  pinMode(motorBEncB, INPUT);
+  // Attach interrupts to Phase A of each encoder
+  attachInterrupt(digitalPinToInterrupt(motorAEncA), readLeftEncoder, RISING);
+  attachInterrupt(digitalPinToInterrupt(motorBEncA), readRightEncoder, RISING);
 
   // IMU setup
-  Wire.begin();
   delay(10);
   if (myIMU.begin())
     Serial.println("Ready.");
   else
-  {
     Serial.println("Could not connect to IMU.");
-    Serial.println("Freezing");
-  }
-
   if (myIMU.initialize(BASIC_SETTINGS))
-    Serial.println("Loaded Settings.");
-  
-   
+    Serial.println("Loaded Settings.");   
+
+  // Create the parallel task on Core 0 for telemetry without interfering with balancing
+  xTaskCreatePinnedToCore(telemetryLoop, "TelemetryTask", 10000, NULL, 1, &Task1, 0);
 }
 
 void loop()
 {
-
-
   unsigned long now = micros();
 
-    // Run control loop every 5ms
-    if (now - lastTime >= 5000) {
-      lastTime = now;
+  // Run control loop every 5ms
+  if (now - lastTime >= 5000) {
+    lastTime = now;
 
-      accAngle = atan2(accY, accZ) * RAD_TO_DEG;
-      int gyroRate = map(gyroX, -250, 250, -125, 125); // map gyro rate to degrees per second
-      gyroAngle = gyroRate * sampleTime;
-      currentAngle = 0.9934 * (prevAngle + gyroAngle) + 
-                     0.0066 * accAngle;
-      error = currentAngle - targetAngle; 
-      errorSum += error * sampleTime; 
-
-      motorPower = Kp * error + Ki * errorSum + Kd * (error - prevError) / sampleTime;
-
-      prevAngle = currentAngle;
-    }
-
+    // read sensor
     accY = myIMU.readFloatAccelY();
     accZ = myIMU.readFloatAccelZ();
     gyroX = myIMU.readFloatGyroX();
 
+    // calculate wheel speed
+    long deltaL = leftEncoderCount - prevLeftCount;
+    long deltaR = rightEncoderCount - prevRightCount;
+    prevLeftCount = leftEncoderCount;
+    prevRightCount = rightEncoderCount;
+    currentSpeed = (deltaL + deltaR) / 2.0;
+
+    // accumulate position (integral of speed) to prevent total drift
+    speedIntegral += currentSpeed;
+    speedIntegral = constrain(speedIntegral, -4000, 4000);
+
+    // if moving forward, subtract angle to lean back
+    float speedAdjustment = (currentSpeed * Kp_speed) + (speedIntegral * Ki_speed);
+    activeTargetAngle = targetAngle - speedAdjustment;
+    activeTargetAngle = constrain(activeTargetAngle, targetAngle - 10, targetAngle + 10);
+
+    // calculate angles
+    accAngle = atan2(accY, accZ) * RAD_TO_DEG;
+    gyroAngle = gyroX * sampleTime;
+    // complimentary filter
+    currentAngle = 0.9934 * (prevAngle + gyroAngle) + 
+                    0.0066 * accAngle;
+    error = currentAngle - activeTargetAngle; 
+    errorSum += error;
+    errorSum = constrain(errorSum, -300, 300);
+
+    // motorPower = Kp * error + Ki * errorSum + Kd * (error - prevError) / sampleTime;
+    motorPower = Kp * error + Ki * errorSum * sampleTime + Kd * gyroX;
+    prevAngle = currentAngle;
+
     motorPower = constrain(motorPower, -255, 255);
     setMotors(motorPower, motorPower);
-
-
-  // cloud data
-  // if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL) { // uncomment to enable telemetry
-  if (false) {
-    float acceleration = myIMU.readFloatAccelX(); // TODO: revise data to send after robot mechanics done
-    float tilt = myIMU.readFloatGyroX();
-
-    ArduinoJson::JsonDocument doc;
-    doc["acceleration"] = acceleration;
-    doc["tilt"] = tilt;
-    char buffer[256];
-    serializeJson(doc, buffer, sizeof(buffer));
-
-    // Send telemetry via HTTPS
-    WiFiClientSecure client;
-    client.setCACert(root_ca); // Set root CA certificate
-    HTTPClient http;
-    http.begin(client, url);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", SAS_TOKEN);
-    int httpCode = http.POST(buffer);
-
-    if (httpCode == 204) { // IoT Hub returns 204 No Content for successful telemetry
-    Serial.println("Telemetry sent: " + String(buffer));
-    } else {
-    Serial.println("Failed to send telemetry. HTTP code: " + String(httpCode));
-    }
-    http.end();
-
-    lastTelemetryTime = millis();
   }
 
-  delay(1000);
+  sharedAccel = accAngle; // or whatever variable you want to graph
+  sharedTilt = gyroAngle;
 }
 
 void setMotors(int leftMotorSpeed, int rightMotorSpeed) {
@@ -212,7 +268,7 @@ void setMotors(int leftMotorSpeed, int rightMotorSpeed) {
 
   }
   else {
-    motors.setSpeedA(255 + leftMotorSpeed); 
+    motors.setSpeedA(abs(leftMotorSpeed)); 
     motors.backwardA();
   }
   if(rightMotorSpeed >= 0) {
@@ -220,7 +276,7 @@ void setMotors(int leftMotorSpeed, int rightMotorSpeed) {
     motors.forwardB();
   }
   else {
-    motors.setSpeedB(255 + rightMotorSpeed);
+    motors.setSpeedB(abs(rightMotorSpeed));
     motors.backwardB();
   }
 }
@@ -228,7 +284,7 @@ void setMotors(int leftMotorSpeed, int rightMotorSpeed) {
 // TODO:
 // #1 Set up: cloud (done), motor driver (done), gyroscope (done)
 // #2 Test individually (just connection)=> review cloud (done), motor driver (not enough torque), and gyroscope (done) from examples or previous assignments
-// TODO: Mix the balancing logic with cloud communication
-// #3 discuss the communication protocol between motor driver and gyropscope (in review)
-// #4 send data to cloud
-// #5 visualize tilt and speed over time
+// Done: Mix the balancing logic with cloud communication
+// #3 discuss the communication protocol between motor driver and gyropscope (fine-tuning)
+// #4 send data to cloud (done)
+// #5 visualize tilt and speed over time (done)
