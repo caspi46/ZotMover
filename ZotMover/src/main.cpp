@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <ArduinoJson.h>
+#include "math.h"
 
 // pin declarations
 #define BAT_ADC 34
@@ -15,6 +16,13 @@
 #define ENBPin 15
 #define motorBPin3 12
 #define motorBPin4 13
+
+
+#define Kp  40
+#define Kd  0.05
+#define Ki  40
+#define sampleTime  0.005
+#define targetAngle -2.5
 
 // Wi-Fi credentials
 #define WIFI_SSID "TC"           // NOTE: Please delete this value before submitting assignment
@@ -56,15 +64,32 @@ const char* root_ca =
 #define TELEMETRY_INTERVAL 3000 // Send data every 3 seconds
 
 
+// IMU object
 LSM6DSO myIMU;
+// Motor driver object
 L298NX2 motors(ENAPin, motorAPin1, motorAPin2, ENBPin, motorBPin3, motorBPin4);
+// motor direction bool 
+bool motorDirection = true; // true: forward, false: backward 
 
+// Cloud variables 
 String iothubName = "ZotMoverHub"; // Your hub name (replace if needed)
 String deviceName = "147esp32";   // Your device name (replace if needed)
 String url = "https://" + iothubName + ".azure-devices.net/devices/" +
              deviceName + "/messages/events?api-version=2021-04-12";
 
-float x, y, z;
+
+// Gyroscope / Accelerometer variables 
+int16_t accX, accY, accZ; // accelerometer values
+int16_t gyroX, gyroY, gyroZ; // gyroscope values
+
+float accAngle, gyroAngle; 
+
+volatile float motorPower, gyroRate, currentAngle, prevAngle = 0, error, prevError=0, errorSum = 0;
+
+int speed;
+
+
+long lastTime = 0;
 uint32_t lastTelemetryTime = 0;
 
 void setup()
@@ -111,17 +136,40 @@ void setup()
 
   if (myIMU.initialize(BASIC_SETTINGS))
     Serial.println("Loaded Settings.");
+  
+   
 }
 
 void loop()
 {
-  // motor driver
-  motors.setSpeed(0);
-  motors.forward();
-  Serial.println("Moving forward");
 
-  // gyroscope: (x, y, z)
-  // accelerometer: (x, y, z)
+
+  unsigned long now = micros();
+
+    // Run control loop every 5ms
+    if (now - lastTime >= 5000) {
+      lastTime = now;
+
+      accAngle = atan2(accY, accZ) * RAD_TO_DEG;
+      int gyroRate = map(gyroX, -250, 250, -125, 125); // map gyro rate to degrees per second
+      gyroAngle = gyroRate * sampleTime;
+      currentAngle = 0.9934 * (prevAngle + gyroAngle) + 
+                     0.0066 * accAngle;
+      error = currentAngle - targetAngle; 
+      errorSum += error * sampleTime; 
+
+      motorPower = Kp * error + Ki * errorSum + Kd * (error - prevError) / sampleTime;
+
+      prevAngle = currentAngle;
+    }
+
+    accY = myIMU.readFloatAccelY();
+    accZ = myIMU.readFloatAccelZ();
+    gyroX = myIMU.readFloatGyroX();
+
+    motorPower = constrain(motorPower, -255, 255);
+    setMotors(motorPower, motorPower);
+
 
   // cloud data
   // if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL) { // uncomment to enable telemetry
@@ -157,9 +205,30 @@ void loop()
   delay(1000);
 }
 
+void setMotors(int leftMotorSpeed, int rightMotorSpeed) {
+  if(leftMotorSpeed >= 0) {
+    motors.setSpeedA(leftMotorSpeed);
+    motors.forwardA();
+
+  }
+  else {
+    motors.setSpeedA(255 + leftMotorSpeed); 
+    motors.backwardA();
+  }
+  if(rightMotorSpeed >= 0) {
+    motors.setSpeedB(rightMotorSpeed);
+    motors.forwardB();
+  }
+  else {
+    motors.setSpeedB(255 + rightMotorSpeed);
+    motors.backwardB();
+  }
+}
+
 // TODO:
 // #1 Set up: cloud (done), motor driver (done), gyroscope (done)
 // #2 Test individually (just connection)=> review cloud (done), motor driver (not enough torque), and gyroscope (done) from examples or previous assignments
-// #3 discuss the communication protocol between motor driver and gyropscope
+// TODO: Mix the balancing logic with cloud communication
+// #3 discuss the communication protocol between motor driver and gyropscope (in review)
 // #4 send data to cloud
 // #5 visualize tilt and speed over time
